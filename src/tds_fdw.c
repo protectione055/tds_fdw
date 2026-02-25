@@ -45,6 +45,7 @@
 #endif
 #include "foreign/fdwapi.h"
 #include "foreign/foreign.h"
+#include "foreign/remoteproc_var.h"
 #include "miscadmin.h"
 #include "mb/pg_wchar.h"
 #include "libpq/pqsignal.h"
@@ -59,6 +60,7 @@
 #include "storage/fd.h"
 #include "utils/array.h"
 #include "utils/builtins.h"
+#include "utils/lsyscache.h"
 #include "utils/rel.h"
 #include "utils/memutils.h"
 #include "utils/guc.h"
@@ -114,6 +116,78 @@ static void tds_signal_handler(int signum);
 static void tds_clear_signals(void);
 static int tds_chkintr_func(void* vdbproc);
 static int tds_hndlintr_func(void* vdbproc);
+
+typedef struct TdsRemoteProcHandle
+{
+	LOGINREC   *login;
+	DBPROCESS  *dbproc;
+	int			ncols;
+	int			ret_code;
+	bool		checked_more_results;
+	bool		has_more_results;
+	bool		has_return_status_target;
+	bool			current_result_exhausted;
+	int			nargs;
+	const Oid *argtypes;
+	const bool *argisout;
+	int			noutargs;
+	int		   *out_arg_indexes;
+	List	   *outputs;
+	bool			outputs_fetched;
+} TdsRemoteProcHandle;
+
+static void tdsAppendBracketQuotedIdent(StringInfo buf, const char *ident);
+static char *tdsEscapeSingleQuotes(const char *src);
+static const char *tdsGetRemoteVarTypeForOid(Oid typeoid);
+static bool tdsShouldFallbackToExecMetadata(const char *remote_schema,
+									 const char *remote_routine);
+static void tdsDrainAllResults(DBPROCESS *dbproc);
+static char *tdsBuildRemoteExecSql(const char *remote_database,
+									 const char *remote_schema,
+									 const char *remote_routine,
+									 int nargs,
+									 const char *const *argnames,
+									 const Oid *argtypes,
+									 const bool *argisout,
+									 const Datum *argvalues,
+									 const bool *argnulls,
+									 bool use_null_args,
+									 bool append_output_select);
+static void tdsRemoteProcOpenConnection(Oid serverOid,
+									Oid userid,
+									TdsFdwOptionSet *option_set,
+									LOGINREC **login,
+									DBPROCESS **dbproc);
+static void tdsRemoteProcCloseConnection(LOGINREC *login, DBPROCESS *dbproc);
+static TupleDesc tdsGetRemoteProcResultDesc(Oid serverOid,
+									 Oid userid,
+									 const char *remote_database,
+									 const char *remote_schema,
+									 const char *remote_routine,
+									 int nargs,
+									 const char *const *argnames,
+									 const Oid *argtypes,
+									 const bool *argisout,
+									 const int32 *argtypmods);
+static void *tdsExecRemoteProc(Oid serverOid,
+							 Oid userid,
+							 const char *remote_database,
+							 const char *remote_schema,
+							 const char *remote_routine,
+							 int nargs,
+							 const char *const *argnames,
+							 const Oid *argtypes,
+							 const bool *argisout,
+							 const Datum *argvalues,
+							 const bool *argnulls,
+							 bool has_return_status_target);
+static TupleDesc tdsGetRemoteProcRuntimeResultDesc(void *handle);
+static bool tdsFetchRemoteProcResult(void *handle, TupleTableSlot *slot);
+static List *tdsGetRemoteProcOutputs(void *handle);
+static bool tdsRemoteProcHasMoreResults(void *handle);
+static bool tdsRemoteProcResultSetIsOutput(TdsRemoteProcHandle *hnd);
+static void tdsRemoteProcConsumeOutputSet(TdsRemoteProcHandle *hnd);
+static void tdsRemoteProcDrainCurrentSet(TdsRemoteProcHandle *hnd, bool mark_more);
 
 /* Executes server query */
 static bool
@@ -179,6 +253,12 @@ PGDLLEXPORT Datum tds_fdw_handler(PG_FUNCTION_ARGS)
 	fdwroutine->IterateForeignScan = tdsIterateForeignScan;
 	fdwroutine->ReScanForeignScan = tdsReScanForeignScan;
 	fdwroutine->EndForeignScan = tdsEndForeignScan;
+	fdwroutine->GetRemoteProcResultDesc = tdsGetRemoteProcResultDesc;
+	fdwroutine->ExecRemoteProc = tdsExecRemoteProc;
+	fdwroutine->GetRemoteProcRuntimeResultDesc = tdsGetRemoteProcRuntimeResultDesc;
+	fdwroutine->FetchRemoteProcResult = tdsFetchRemoteProcResult;
+	fdwroutine->GetRemoteProcOutputs = tdsGetRemoteProcOutputs;
+	fdwroutine->RemoteProcHasMoreResults = tdsRemoteProcHasMoreResults;
 
 #ifdef IMPORT_API
 	fdwroutine->ImportForeignSchema = tdsImportForeignSchema;
@@ -3192,6 +3272,899 @@ cleanup:
 	return (erc == SUCCEED);
 }
 
+static void
+tdsAppendBracketQuotedIdent(StringInfo buf, const char *ident)
+{
+	const char *p;
+
+	appendStringInfoChar(buf, '[');
+	for (p = ident; *p != '\0'; p++)
+	{
+		if (*p == ']')
+			appendStringInfoString(buf, "]]"
+									);
+		else
+			appendStringInfoChar(buf, *p);
+	}
+	appendStringInfoChar(buf, ']');
+}
+
+static char *
+tdsEscapeSingleQuotes(const char *src)
+{
+	StringInfoData buf;
+	const char *p;
+
+	initStringInfo(&buf);
+	for (p = src; *p != '\0'; p++)
+	{
+		appendStringInfoChar(&buf, *p);
+		if (*p == '\'')
+			appendStringInfoChar(&buf, '\'');
+	}
+
+	return buf.data;
+}
+
+static char *
+tdsBuildRemoteExecSql(const char *remote_database,
+					  const char *remote_schema,
+					  const char *remote_routine,
+					  int nargs,
+					  const char *const *argnames,
+					  const Oid *argtypes,
+					  const bool *argisout,
+					  const Datum *argvalues,
+					  const bool *argnulls,
+					  bool use_null_args,
+					  bool append_output_select)
+{
+	StringInfoData preamble;
+	StringInfoData execbuf;
+	StringInfoData tail;
+	StringInfoData buf;
+	int			 i;
+	bool		 has_output_args = false;
+
+	initStringInfo(&preamble);
+	initStringInfo(&execbuf);
+	initStringInfo(&tail);
+
+	for (i = 0; i < nargs; i++)
+	{
+		bool		is_output_arg = (argisout && argisout[i]);
+		const char *var_decl_type;
+
+		if (!is_output_arg)
+			continue;
+
+		has_output_args = true;
+		var_decl_type = tdsGetRemoteVarTypeForOid(argtypes[i]);
+		appendStringInfo(&preamble,
+						 "DECLARE @__bbf_out_%d %s; ",
+						 i + 1,
+						 var_decl_type);
+
+		if (!use_null_args && !(argnulls && argnulls[i]))
+		{
+			Oid			 outputfunc;
+			bool		 typisvarlena;
+			char		*external;
+			char		*quoted;
+
+			getTypeOutputInfo(argtypes[i], &outputfunc, &typisvarlena);
+			external = OidOutputFunctionCall(outputfunc, argvalues[i]);
+			quoted = quote_literal_cstr(external);
+			appendStringInfo(&preamble,
+							 "SET @__bbf_out_%d = CAST(%s AS %s); ",
+							 i + 1,
+							 quoted,
+							 var_decl_type);
+		}
+	}
+
+	appendStringInfoString(&execbuf, "EXEC ");
+	tdsAppendBracketQuotedIdent(&execbuf, remote_database);
+	appendStringInfoChar(&execbuf, '.');
+	tdsAppendBracketQuotedIdent(&execbuf, remote_schema);
+	appendStringInfoChar(&execbuf, '.');
+	tdsAppendBracketQuotedIdent(&execbuf, remote_routine);
+
+	for (i = 0; i < nargs; i++)
+	{
+		bool		is_output_arg = (argisout && argisout[i]);
+
+		if (i == 0)
+			appendStringInfoChar(&execbuf, ' ');
+		else
+			appendStringInfoString(&execbuf, ", ");
+
+		if (argnames && argnames[i] != NULL)
+		{
+			const char *argname = argnames[i];
+
+			if (argname[0] == '@')
+				argname++;
+
+			appendStringInfo(&execbuf, "@%s = ", argname);
+		}
+
+		if (is_output_arg)
+		{
+			appendStringInfo(&execbuf, "@__bbf_out_%d OUTPUT", i + 1);
+			continue;
+		}
+
+		if (use_null_args || (argnulls && argnulls[i]))
+			appendStringInfoString(&execbuf, "NULL");
+		else
+		{
+			Oid			 outputfunc;
+			bool		 typisvarlena;
+			char		*external;
+			char		*quoted;
+
+			getTypeOutputInfo(argtypes[i], &outputfunc, &typisvarlena);
+			external = OidOutputFunctionCall(outputfunc, argvalues[i]);
+			quoted = quote_literal_cstr(external);
+			appendStringInfoString(&execbuf, quoted);
+		}
+	}
+
+	if (append_output_select && has_output_args)
+	{
+		appendStringInfoString(&tail, "; SELECT ");
+		for (i = 0; i < nargs; i++)
+		{
+			if (!(argisout && argisout[i]))
+				continue;
+
+			if (tail.len > (int) strlen("; SELECT "))
+				appendStringInfoString(&tail, ", ");
+
+			appendStringInfo(&tail,
+							 "@__bbf_out_%d AS [__bbf_out_%d]",
+							 i + 1,
+							 i + 1);
+		}
+	}
+
+	initStringInfo(&buf);
+	appendStringInfoString(&buf, preamble.data);
+	appendStringInfoString(&buf, execbuf.data);
+	appendStringInfoString(&buf, tail.data);
+
+	return buf.data;
+}
+
+static const char *
+tdsGetRemoteVarTypeForOid(Oid typeoid)
+{
+	switch (typeoid)
+	{
+		case BOOLOID:
+			return "bit";
+		case INT2OID:
+			return "smallint";
+		case INT4OID:
+			return "int";
+		case INT8OID:
+			return "bigint";
+		case FLOAT4OID:
+			return "real";
+		case FLOAT8OID:
+			return "float";
+		case NUMERICOID:
+			return "numeric(38, 10)";
+		case DATEOID:
+			return "date";
+		case TIMEOID:
+			return "time";
+		case TIMESTAMPOID:
+			return "datetime2";
+		case TIMESTAMPTZOID:
+			return "datetimeoffset";
+		case UUIDOID:
+			return "uniqueidentifier";
+		case BYTEAOID:
+			return "varbinary(max)";
+		case BPCHAROID:
+		case VARCHAROID:
+		case TEXTOID:
+		case NAMEOID:
+		default:
+			return "nvarchar(max)";
+	}
+}
+
+static bool
+tdsShouldFallbackToExecMetadata(const char *remote_schema,
+									 const char *remote_routine)
+{
+	if (remote_schema != NULL && pg_strcasecmp(remote_schema, "sys") == 0)
+		return true;
+
+	if (remote_routine != NULL)
+	{
+		if (pg_strncasecmp(remote_routine, "sp_", 3) == 0)
+			return true;
+		if (pg_strncasecmp(remote_routine, "xp_", 3) == 0)
+			return true;
+	}
+
+	return false;
+}
+
+static void
+tdsDrainAllResults(DBPROCESS *dbproc)
+{
+	RETCODE erc;
+	int		ret_code;
+
+	while ((ret_code = dbnextrow(dbproc)) != NO_MORE_ROWS)
+	{
+		if (ret_code == BUF_FULL)
+			break;
+	}
+
+	while ((erc = dbresults(dbproc)) == SUCCEED)
+	{
+		while ((ret_code = dbnextrow(dbproc)) != NO_MORE_ROWS)
+		{
+			if (ret_code == BUF_FULL)
+				break;
+		}
+	}
+}
+
+static void
+tdsRemoteProcOpenConnection(Oid serverOid,
+						 Oid userid,
+						 TdsFdwOptionSet *option_set,
+						 LOGINREC **login,
+						 DBPROCESS **dbproc)
+{
+	(void) userid;
+
+	tds_clear_signals();
+	tdsGetForeignServerOptionsFromCatalog(serverOid, option_set);
+
+	if (dbinit() == FAIL)
+		ereport(ERROR,
+				(errcode(ERRCODE_FDW_OUT_OF_MEMORY),
+				 errmsg("Failed to initialize DB-Library environment")));
+
+	dberrhandle(tds_err_handler);
+
+	if (option_set->msg_handler)
+	{
+		if (strcmp(option_set->msg_handler, "notice") == 0)
+			dbmsghandle(tds_notice_msg_handler);
+		else if (strcmp(option_set->msg_handler, "blackhole") == 0)
+			dbmsghandle(tds_blackhole_msg_handler);
+		else
+			ereport(ERROR,
+					(errcode(ERRCODE_SYNTAX_ERROR),
+					 errmsg("Unknown msg handler: %s.", option_set->msg_handler)));
+	}
+
+	*login = dblogin();
+	if (*login == NULL)
+		ereport(ERROR,
+				(errcode(ERRCODE_FDW_OUT_OF_MEMORY),
+				 errmsg("Failed to initialize DB-Library login structure")));
+
+	if (tdsSetupConnection(option_set, *login, dbproc) != 0)
+		ereport(ERROR,
+				(errcode(ERRCODE_FDW_UNABLE_TO_ESTABLISH_CONNECTION),
+				 errmsg("failed to setup TDS connection")));
+}
+
+static void
+tdsRemoteProcCloseConnection(LOGINREC *login, DBPROCESS *dbproc)
+{
+	if (dbproc)
+		dbclose(dbproc);
+	if (login)
+		dbloginfree(login);
+	dbexit();
+	tds_clear_signals();
+}
+
+static TupleDesc
+tdsGetRemoteProcResultDesc(Oid serverOid,
+					 Oid userid,
+					 const char *remote_database,
+					 const char *remote_schema,
+					 const char *remote_routine,
+					 int nargs,
+					 const char *const *argnames,
+					 const Oid *argtypes,
+					 const bool *argisout,
+					 const int32 *argtypmods)
+{
+	TdsFdwOptionSet option_set;
+	LOGINREC   *login = NULL;
+	DBPROCESS  *dbproc = NULL;
+	TupleDesc	tupdesc = NULL;
+	char		*exec_sql = NULL;
+	char		*escaped_exec_sql = NULL;
+	char		*metadata_sql = NULL;
+	int			ret_code;
+	List	   *colnames = NIL;
+	char		bind_colname[256] = {0};
+	RETCODE		erc;
+	bool		metadata_probe_ok = false;
+	bool		use_exec_fallback = false;
+	ListCell   *lc;
+	int			attnum;
+
+	(void) argtypes;
+	(void) argtypmods;
+
+	tdsRemoteProcOpenConnection(serverOid, userid, &option_set, &login, &dbproc);
+
+	PG_TRY();
+	{
+		exec_sql = tdsBuildRemoteExecSql(remote_database,
+									 remote_schema,
+									 remote_routine,
+									 nargs,
+									 argnames,
+									 argtypes,
+									 argisout,
+									 NULL,
+									 NULL,
+									 true,
+									 false);
+		escaped_exec_sql = tdsEscapeSingleQuotes(exec_sql);
+		metadata_sql = psprintf("EXEC sp_describe_first_result_set N'%s', NULL, 0",
+							  escaped_exec_sql);
+		use_exec_fallback = tdsShouldFallbackToExecMetadata(remote_schema, remote_routine);
+
+		dberrhandle(tds_err_capture);
+		last_error_message = NULL;
+
+		if (dbcmd(dbproc, metadata_sql) == SUCCEED &&
+			dbsqlexec(dbproc) == SUCCEED)
+		{
+			erc = dbresults(dbproc);
+			if (erc == SUCCEED)
+				metadata_probe_ok = true;
+		}
+
+		dberrhandle(tds_err_handler);
+
+		if (!metadata_probe_ok)
+		{
+			if (!use_exec_fallback)
+				goto metadata_done;
+
+			dberrhandle(tds_err_capture);
+			last_error_message = NULL;
+
+			if (dbcmd(dbproc, exec_sql) == SUCCEED &&
+				dbsqlexec(dbproc) == SUCCEED)
+			{
+				erc = dbresults(dbproc);
+				while (erc == SUCCEED && dbnumcols(dbproc) == 0)
+				{
+					while ((ret_code = dbnextrow(dbproc)) != NO_MORE_ROWS)
+					{
+						if (ret_code == BUF_FULL)
+							break;
+					}
+					erc = dbresults(dbproc);
+				}
+
+				if (erc == SUCCEED && dbnumcols(dbproc) > 0)
+				{
+					int i;
+					int ncols = dbnumcols(dbproc);
+
+					for (i = 1; i <= ncols; i++)
+					{
+						char *colname = dbcolname(dbproc, i);
+
+						if (colname == NULL || colname[0] == '\0')
+							colnames = lappend(colnames, pstrdup("?column?"));
+						else
+							colnames = lappend(colnames, pstrdup(colname));
+					}
+				}
+			}
+
+			tdsDrainAllResults(dbproc);
+			dberrhandle(tds_err_handler);
+			goto build_desc;
+		}
+
+		erc = dbbind(dbproc, 3, NTBSTRINGBIND, sizeof(bind_colname), (BYTE *) bind_colname);
+		if (erc == FAIL)
+			ereport(ERROR,
+					(errcode(ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION),
+					 errmsg("Failed to bind results for metadata column \"name\".")));
+
+		while ((ret_code = dbnextrow(dbproc)) != NO_MORE_ROWS)
+		{
+			if (ret_code == REG_ROW)
+			{
+				if (bind_colname[0] == '\0')
+					colnames = lappend(colnames, pstrdup("?column?"));
+				else
+					colnames = lappend(colnames, pstrdup(bind_colname));
+			}
+			else if (ret_code == BUF_FULL)
+				ereport(ERROR,
+						(errcode(ERRCODE_FDW_OUT_OF_MEMORY),
+						 errmsg("Buffer filled while fetching remote procedure metadata")));
+			else
+				ereport(ERROR,
+						(errcode(ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION),
+						 errmsg("Failed fetching remote procedure metadata rows")));
+		}
+
+		if (colnames != NIL)
+		{
+			goto build_desc;
+		}
+
+build_desc:
+		if (colnames != NIL)
+		{
+			tupdesc = CreateTemplateTupleDesc(list_length(colnames));
+			attnum = 1;
+			foreach(lc, colnames)
+			{
+				char *colname = (char *) lfirst(lc);
+
+				TupleDescInitEntry(tupdesc,
+							   (AttrNumber) attnum,
+							   colname,
+							   TEXTOID,
+							   -1,
+							   0);
+				attnum++;
+			}
+			tupdesc = BlessTupleDesc(tupdesc);
+		}
+
+metadata_done:
+		;
+	}
+	PG_FINALLY();
+	{
+		tdsRemoteProcCloseConnection(login, dbproc);
+	}
+	PG_END_TRY();
+
+	return tupdesc;
+}
+
+static void *
+tdsExecRemoteProc(Oid serverOid,
+			 Oid userid,
+			 const char *remote_database,
+			 const char *remote_schema,
+			 const char *remote_routine,
+			 int nargs,
+			 const char *const *argnames,
+			 const Oid *argtypes,
+			 const bool *argisout,
+			 const Datum *argvalues,
+			 const bool *argnulls,
+			 bool has_return_status_target)
+{
+	TdsFdwOptionSet option_set;
+	TdsRemoteProcHandle *h;
+	char		*exec_sql;
+	RETCODE		erc;
+	int			i;
+
+	h = palloc0(sizeof(TdsRemoteProcHandle));
+	h->has_return_status_target = has_return_status_target;
+	h->current_result_exhausted = false;
+	h->nargs = nargs;
+	h->argtypes = argtypes;
+	h->argisout = argisout;
+	h->noutargs = 0;
+	h->outputs = NIL;
+	h->outputs_fetched = false;
+
+	for (i = 0; i < nargs; i++)
+	{
+		if (argisout && argisout[i])
+			h->noutargs++;
+	}
+
+	if (h->noutargs > 0)
+	{
+		int outidx = 0;
+
+		h->out_arg_indexes = palloc0(sizeof(int) * h->noutargs);
+		for (i = 0; i < nargs; i++)
+		{
+			if (!(argisout && argisout[i]))
+				continue;
+			h->out_arg_indexes[outidx++] = i;
+		}
+	}
+
+	tdsRemoteProcOpenConnection(serverOid, userid, &option_set, &h->login, &h->dbproc);
+
+	exec_sql = tdsBuildRemoteExecSql(remote_database,
+								remote_schema,
+								remote_routine,
+								nargs,
+								argnames,
+								argtypes,
+								argisout,
+								argvalues,
+								argnulls,
+								false,
+								true);
+
+	if ((erc = dbsetopt(h->dbproc, DBTEXTSIZE, "2147483647", -1)) == FAIL)
+		ereport(WARNING,
+				(errcode(ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION),
+				 errmsg("Failed to set DBTEXTLIMIT server option, blob sizes may be truncated")));
+
+	if ((erc = dbcmd(h->dbproc, exec_sql)) == FAIL)
+		ereport(ERROR,
+				(errcode(ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION),
+				 errmsg("Failed to set current query to %s", exec_sql)));
+
+	if ((erc = dbsqlexec(h->dbproc)) == FAIL)
+		ereport(ERROR,
+				(errcode(ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION),
+				 errmsg("Failed to execute query %s", exec_sql)));
+
+	h->ret_code = dbresults(h->dbproc);
+	if (h->ret_code == FAIL)
+		ereport(ERROR,
+				(errcode(ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION),
+				 errmsg("Failed to get results from query %s", exec_sql)));
+
+	while (h->ret_code == SUCCEED && dbnumcols(h->dbproc) == 0)
+	{
+		h->ret_code = dbresults(h->dbproc);
+		if (h->ret_code == FAIL)
+			ereport(ERROR,
+					(errcode(ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION),
+					 errmsg("Failed to get results from query %s", exec_sql)));
+	}
+
+	if (h->ret_code == SUCCEED)
+		h->ncols = dbnumcols(h->dbproc);
+	else if (h->ret_code == NO_MORE_RESULTS)
+		h->ncols = 0;
+
+	return h;
+}
+
+static bool
+tdsFetchRemoteProcResult(void *handle, TupleTableSlot *slot)
+{
+	TdsRemoteProcHandle *h = (TdsRemoteProcHandle *) handle;
+	int			ret_code;
+	int			i;
+	int			natts;
+
+	if (h->ret_code != SUCCEED || h->ncols <= 0)
+		return false;
+
+	/*
+	 * __bbf_out_* rows are an internal transport for OUTPUT parameters.
+	 * They must not be pushed as user-visible rowsets.
+	 */
+	if (tdsRemoteProcResultSetIsOutput(h))
+	{
+		tdsRemoteProcConsumeOutputSet(h);
+		h->current_result_exhausted = true;
+		return false;
+	}
+
+	ret_code = dbnextrow(h->dbproc);
+	if (ret_code == NO_MORE_ROWS)
+	{
+		h->current_result_exhausted = true;
+		return false;
+	}
+	if (ret_code == BUF_FULL)
+		ereport(ERROR,
+				(errcode(ERRCODE_FDW_OUT_OF_MEMORY),
+				 errmsg("Buffer filled while fetching remote procedure result")));
+	if (ret_code != REG_ROW)
+		ereport(ERROR,
+				(errcode(ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION),
+				 errmsg("Failed to fetch remote procedure result row")));
+
+	ExecClearTuple(slot);
+	natts = Min(slot->tts_tupleDescriptor->natts, h->ncols);
+
+	for (i = 0; i < natts; i++)
+	{
+		BYTE	   *src;
+		DBINT		srclen;
+		int			srctype;
+
+		srclen = dbdatlen(h->dbproc, i + 1);
+		src = dbdata(h->dbproc, i + 1);
+		srctype = dbcoltype(h->dbproc, i + 1);
+
+		if (srclen == 0 && src == NULL)
+		{
+			slot->tts_isnull[i] = true;
+			slot->tts_values[i] = (Datum) 0;
+		}
+		else
+		{
+			char *cstring = tdsConvertToCString(h->dbproc, srctype, src, srclen);
+
+			if (cstring == NULL)
+				ereport(ERROR,
+						(errcode(ERRCODE_FDW_INVALID_ATTRIBUTE_VALUE),
+						 errmsg("failed to convert remote procedure result value")));
+
+			slot->tts_values[i] = PointerGetDatum(cstring_to_text(cstring));
+			slot->tts_isnull[i] = false;
+		}
+	}
+
+	for (; i < slot->tts_tupleDescriptor->natts; i++)
+	{
+		slot->tts_isnull[i] = true;
+		slot->tts_values[i] = (Datum) 0;
+	}
+
+	ExecStoreVirtualTuple(slot);
+	return true;
+}
+
+static TupleDesc
+tdsGetRemoteProcRuntimeResultDesc(void *handle)
+{
+	TdsRemoteProcHandle *h = (TdsRemoteProcHandle *) handle;
+	TupleDesc	result_desc;
+	int			i;
+
+	if (h == NULL || h->ret_code != SUCCEED || h->ncols <= 0 || h->dbproc == NULL)
+		return NULL;
+
+	/*
+	 * Do not expose synthetic OUTPUT transport columns as runtime rowsets.
+	 */
+	if (tdsRemoteProcResultSetIsOutput(h))
+		return NULL;
+
+	result_desc = CreateTemplateTupleDesc(h->ncols);
+	for (i = 1; i <= h->ncols; i++)
+	{
+		char *colname = dbcolname(h->dbproc, i);
+
+		if (colname == NULL || colname[0] == '\0')
+			colname = "?column?";
+
+		TupleDescInitEntry(result_desc,
+					   (AttrNumber) i,
+					   colname,
+					   TEXTOID,
+					   -1,
+					   0);
+	}
+
+	return BlessTupleDesc(result_desc);
+}
+
+static bool
+tdsRemoteProcResultSetIsOutput(TdsRemoteProcHandle *hnd)
+{
+	int			i;
+
+	if (hnd->noutargs <= 0 || dbnumcols(hnd->dbproc) != hnd->noutargs)
+		return false;
+
+	for (i = 0; i < hnd->noutargs; i++)
+	{
+		char		expected_colname[32];
+		char		*actual_colname;
+
+		snprintf(expected_colname, sizeof(expected_colname), "__bbf_out_%d", hnd->out_arg_indexes[i] + 1);
+		actual_colname = dbcolname(hnd->dbproc, i + 1);
+
+		if (actual_colname == NULL || strcmp(actual_colname, expected_colname) != 0)
+			return false;
+	}
+
+	return true;
+}
+
+static void
+tdsRemoteProcConsumeOutputSet(TdsRemoteProcHandle *hnd)
+{
+	int			resultcode;
+	int			i;
+
+	resultcode = dbnextrow(hnd->dbproc);
+	if (resultcode == REG_ROW)
+	{
+		for (i = 0; i < hnd->noutargs; i++)
+		{
+			int			arg_index = hnd->out_arg_indexes[i];
+			DBINT		srclen;
+			BYTE	   *src;
+			int			srctype;
+			RemoteProcOutputValue *out;
+
+			srclen = dbdatlen(hnd->dbproc, i + 1);
+			src = dbdata(hnd->dbproc, i + 1);
+			srctype = dbcoltype(hnd->dbproc, i + 1);
+
+			out = palloc0(sizeof(RemoteProcOutputValue));
+			out->arg_index = arg_index;
+			out->valtypmod = -1;
+
+			if (srclen == 0 && src == NULL)
+			{
+				out->isnull = true;
+				out->valtype = (hnd->argtypes && hnd->argtypes[arg_index] != InvalidOid)
+					? hnd->argtypes[arg_index]
+					: TEXTOID;
+			}
+			else
+			{
+				char *cstring = tdsConvertToCString(hnd->dbproc, srctype, src, srclen);
+
+				if (cstring == NULL)
+					ereport(ERROR,
+							(errcode(ERRCODE_FDW_INVALID_ATTRIBUTE_VALUE),
+							 errmsg("failed to convert remote procedure OUTPUT value")));
+
+				out->valtype = TEXTOID;
+				out->value = PointerGetDatum(cstring_to_text(cstring));
+				out->isnull = false;
+			}
+
+			hnd->outputs = lappend(hnd->outputs, out);
+		}
+
+		while ((resultcode = dbnextrow(hnd->dbproc)) != NO_MORE_ROWS)
+		{
+			if (resultcode == BUF_FULL)
+				ereport(ERROR,
+						(errcode(ERRCODE_FDW_OUT_OF_MEMORY),
+						 errmsg("Buffer filled while fetching remote procedure OUTPUT row")));
+			hnd->has_more_results = true;
+		}
+	}
+	else if (resultcode == NO_MORE_ROWS)
+	{
+		for (i = 0; i < hnd->noutargs; i++)
+		{
+			RemoteProcOutputValue *out = palloc0(sizeof(RemoteProcOutputValue));
+
+			out->arg_index = hnd->out_arg_indexes[i];
+			out->valtype = (hnd->argtypes && hnd->argtypes[out->arg_index] != InvalidOid)
+				? hnd->argtypes[out->arg_index]
+				: TEXTOID;
+			out->valtypmod = -1;
+			out->isnull = true;
+			hnd->outputs = lappend(hnd->outputs, out);
+		}
+	}
+	else if (resultcode == BUF_FULL)
+		ereport(ERROR,
+				(errcode(ERRCODE_FDW_OUT_OF_MEMORY),
+				 errmsg("Buffer filled while fetching remote procedure OUTPUT row")));
+	else
+		ereport(ERROR,
+				(errcode(ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION),
+				 errmsg("Failed to fetch remote procedure OUTPUT row")));
+}
+
+static void
+tdsRemoteProcDrainCurrentSet(TdsRemoteProcHandle *hnd, bool mark_more)
+{
+	int resultcode;
+
+	while ((resultcode = dbnextrow(hnd->dbproc)) != NO_MORE_ROWS)
+	{
+		if (resultcode == BUF_FULL)
+			ereport(ERROR,
+					(errcode(ERRCODE_FDW_OUT_OF_MEMORY),
+					 errmsg("Buffer filled while draining remote procedure result row")));
+		if (mark_more)
+			hnd->has_more_results = true;
+	}
+}
+
+static List *
+tdsGetRemoteProcOutputs(void *handle)
+{
+	TdsRemoteProcHandle *h = (TdsRemoteProcHandle *) handle;
+	RETCODE		erc;
+
+	if (h == NULL)
+		return NIL;
+
+	if (h->outputs_fetched)
+		return h->outputs;
+
+	h->outputs_fetched = true;
+	h->checked_more_results = true;
+	h->has_more_results = false;
+
+	if (h->dbproc == NULL)
+		return h->outputs;
+
+	if (!h->current_result_exhausted && h->ret_code == SUCCEED && dbnumcols(h->dbproc) > 0)
+	{
+		if (tdsRemoteProcResultSetIsOutput(h))
+			tdsRemoteProcConsumeOutputSet(h);
+		else
+			tdsRemoteProcDrainCurrentSet(h, false);
+
+		h->current_result_exhausted = true;
+	}
+
+	while ((erc = dbresults(h->dbproc)) != NO_MORE_RESULTS)
+	{
+		if (erc == FAIL)
+			ereport(ERROR,
+					(errcode(ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION),
+					 errmsg("Failed to get additional results from remote procedure execution")));
+
+		if (erc != SUCCEED || dbnumcols(h->dbproc) <= 0)
+			continue;
+
+		if (tdsRemoteProcResultSetIsOutput(h))
+			tdsRemoteProcConsumeOutputSet(h);
+		else
+			tdsRemoteProcDrainCurrentSet(h, true);
+	}
+
+	tdsRemoteProcCloseConnection(h->login, h->dbproc);
+	h->login = NULL;
+	h->dbproc = NULL;
+
+	return h->outputs;
+}
+
+static bool
+tdsRemoteProcHasMoreResults(void *handle)
+{
+	TdsRemoteProcHandle *h = (TdsRemoteProcHandle *) handle;
+	RETCODE		erc;
+
+	if (h == NULL)
+		return false;
+
+	if (h->checked_more_results)
+		return h->has_more_results;
+
+	if (h->dbproc == NULL)
+		return false;
+
+	h->checked_more_results = true;
+	h->has_more_results = false;
+
+	while ((erc = dbresults(h->dbproc)) != NO_MORE_RESULTS)
+	{
+		if (erc == FAIL)
+			ereport(ERROR,
+					(errcode(ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION),
+					 errmsg("Failed while checking additional remote procedure result sets")));
+
+		if (erc == SUCCEED && dbnumcols(h->dbproc) > 0)
+		{
+			h->has_more_results = true;
+			break;
+		}
+	}
+
+	return h->has_more_results;
+}
+
 #ifdef IMPORT_API
 
 static List *
@@ -3230,6 +4203,8 @@ tdsImportSqlServerSchema(ImportForeignSchemaStmt *stmt, DBPROCESS  *dbproc,
 	/*
 	 * Fetch all table data from this schema, possibly restricted by
 	 * EXCEPT or LIMIT TO.  (We don't actually need to pay any attention
+						(errcode(ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION),
+						 errmsg("Failed to check for additional remote procedure result sets")));
 	 * to EXCEPT/LIMIT TO here, because the core code will filter the
 	 * statements we return according to those lists anyway.  But it
 	 * should save a few cycles to not process excluded tables in the

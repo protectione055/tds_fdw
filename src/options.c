@@ -20,6 +20,7 @@
 #include "utils/builtins.h"
 #include "utils/rel.h"
 #include "utils/memutils.h"
+#include "utils/syscache.h"
 
 #if (PG_VERSION_NUM >= 90200)
 #include "optimizer/pathnode.h"
@@ -45,6 +46,89 @@ void tdsSetDefaultOptions(TdsFdwOptionSet *option_set);
 
 bool tdsIsValidOption(const char *option, Oid context);
 void tdsOptionSetInit(TdsFdwOptionSet* option_set);
+
+static UserMapping *tdsGetUserMappingIfExists(Oid userid, Oid serverid);
+static bool tdsUserMappingHasRequiredCredentials(UserMapping *mapping);
+static UserMapping *tdsGetCredentialBearingUserMapping(Oid serverid);
+
+static UserMapping *
+tdsGetUserMappingIfExists(Oid userid, Oid serverid)
+{
+	Datum		datum;
+	HeapTuple	tp;
+	bool		isnull;
+	UserMapping *mapping;
+
+	tp = SearchSysCache2(USERMAPPINGUSERSERVER,
+							 ObjectIdGetDatum(userid),
+							 ObjectIdGetDatum(serverid));
+	if (!HeapTupleIsValid(tp))
+		return NULL;
+
+	mapping = (UserMapping *) palloc(sizeof(UserMapping));
+	mapping->umid = ((Form_pg_user_mapping) GETSTRUCT(tp))->oid;
+	mapping->userid = userid;
+	mapping->serverid = serverid;
+
+	datum = SysCacheGetAttr(USERMAPPINGUSERSERVER,
+						   tp,
+						   Anum_pg_user_mapping_umoptions,
+						   &isnull);
+	if (isnull)
+		mapping->options = NIL;
+	else
+		mapping->options = untransformRelOptions(datum);
+
+	ReleaseSysCache(tp);
+
+	return mapping;
+}
+
+static bool
+tdsUserMappingHasRequiredCredentials(UserMapping *mapping)
+{
+	ListCell   *option;
+	bool		has_username = false;
+	bool		has_password = false;
+
+	if (mapping == NULL)
+		return false;
+
+	foreach(option, mapping->options)
+	{
+		DefElem    *def = (DefElem *) lfirst(option);
+		char	   *value;
+
+		if (strcmp(def->defname, "username") == 0)
+		{
+			value = defGetString(def);
+			has_username = (value && strlen(value) > 0);
+		}
+		else if (strcmp(def->defname, "password") == 0)
+		{
+			value = defGetString(def);
+			has_password = (value && strlen(value) > 0);
+		}
+	}
+
+	return has_username && has_password;
+}
+
+static UserMapping *
+tdsGetCredentialBearingUserMapping(Oid serverid)
+{
+	UserMapping *mapping;
+
+	mapping = tdsGetUserMappingIfExists(GetUserId(), serverid);
+	if (tdsUserMappingHasRequiredCredentials(mapping))
+		return mapping;
+
+	mapping = tdsGetUserMappingIfExists(InvalidOid, serverid);
+	if (tdsUserMappingHasRequiredCredentials(mapping))
+		return mapping;
+
+	return NULL;
+}
 
 /* these are valid options */
 
@@ -160,7 +244,12 @@ void tdsGetForeignServerOptionsFromCatalog(Oid foreignserverid, TdsFdwOptionSet*
 	tdsOptionSetInit(option_set);
 
 	f_server = GetForeignServer(foreignserverid);
-	f_mapping = GetUserMapping(GetUserId(), foreignserverid);
+	f_mapping = tdsGetCredentialBearingUserMapping(foreignserverid);
+	if (f_mapping == NULL)
+		ereport(ERROR,
+				(errcode(ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION),
+				 errmsg("No credential-bearing linked-server login mapping exists for server \"%s\"", f_server->servername),
+				 errdetail("Configure a linked login with both remote user and password using sp_addlinkedsrvlogin.")));
 
 	tdsGetForeignServerOptions(f_server->options, option_set);
 	tdsGetForeignServerTableOptions(f_server->options, option_set);
@@ -194,7 +283,12 @@ void tdsGetForeignTableOptionsFromCatalog(Oid foreigntableid, TdsFdwOptionSet* o
 	
 	f_table = GetForeignTable(foreigntableid);
 	f_server = GetForeignServer(f_table->serverid);
-	f_mapping = GetUserMapping(GetUserId(), f_table->serverid);
+	f_mapping = tdsGetCredentialBearingUserMapping(f_table->serverid);
+	if (f_mapping == NULL)
+		ereport(ERROR,
+				(errcode(ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION),
+				 errmsg("No credential-bearing linked-server login mapping exists for server \"%s\"", f_server->servername),
+				 errdetail("Configure a linked login with both remote user and password using sp_addlinkedsrvlogin.")));
 	
 	tdsGetForeignServerOptions(f_server->options, option_set);
 	tdsGetForeignServerTableOptions(f_server->options, option_set);
