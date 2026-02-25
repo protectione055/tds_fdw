@@ -1385,8 +1385,7 @@ char* tdsConvertToCString(DBPROCESS* dbproc, int srctype, const BYTE* src, DBINT
 			{
 				const char *datetime_str = timestamptz_to_str(DatumGetTimestamp(datetime_out));
 				
-				dest = palloc(strlen(datetime_str) * sizeof(char));
-				strcpy(dest, datetime_str);
+				dest = pstrdup(datetime_str);
 				
 				use_tds_conversion = 0;
 			}
@@ -3275,6 +3274,43 @@ tdsAppendBracketQuotedIdent(StringInfo buf, const char *ident)
 }
 
 static char *
+tdsFormatRemoteExecArgLiteral(Oid argtype, Datum value)
+{
+	if (argtype == BOOLOID)
+	{
+		if (DatumGetBool(value))
+			return pstrdup("1");
+		return pstrdup("0");
+	}
+
+	if (argtype == BYTEAOID)
+	{
+		bytea	  *bytes = DatumGetByteaPP(value);
+		int			len = VARSIZE_ANY_EXHDR(bytes);
+		char	   *data = VARDATA_ANY(bytes);
+		StringInfoData hex;
+		int			i;
+
+		initStringInfo(&hex);
+		appendStringInfoString(&hex, "0x");
+		for (i = 0; i < len; i++)
+			appendStringInfo(&hex, "%02X", (unsigned char) data[i]);
+
+		return hex.data;
+	}
+
+	{
+		Oid			 outputfunc;
+		bool		 typisvarlena;
+		char		*external;
+
+		getTypeOutputInfo(argtype, &outputfunc, &typisvarlena);
+		external = OidOutputFunctionCall(outputfunc, value);
+		return quote_literal_cstr(external);
+	}
+}
+
+static char *
 tdsBuildRemoteExecSql(const char *remote_database,
 					  const char *remote_schema,
 					  const char *remote_routine,
@@ -3315,14 +3351,9 @@ tdsBuildRemoteExecSql(const char *remote_database,
 
 		if (!use_null_args && !(argnulls && argnulls[i]))
 		{
-			Oid			 outputfunc;
-			bool		 typisvarlena;
-			char		*external;
 			char		*quoted;
 
-			getTypeOutputInfo(argtypes[i], &outputfunc, &typisvarlena);
-			external = OidOutputFunctionCall(outputfunc, argvalues[i]);
-			quoted = quote_literal_cstr(external);
+			quoted = tdsFormatRemoteExecArgLiteral(argtypes[i], argvalues[i]);
 			appendStringInfo(&preamble,
 							 "SET @__bbf_out_%d = CAST(%s AS %s); ",
 							 i + 1,
@@ -3367,14 +3398,9 @@ tdsBuildRemoteExecSql(const char *remote_database,
 			appendStringInfoString(&execbuf, "NULL");
 		else
 		{
-			Oid			 outputfunc;
-			bool		 typisvarlena;
-			char		*external;
 			char		*quoted;
 
-			getTypeOutputInfo(argtypes[i], &outputfunc, &typisvarlena);
-			external = OidOutputFunctionCall(outputfunc, argvalues[i]);
-			quoted = quote_literal_cstr(external);
+			quoted = tdsFormatRemoteExecArgLiteral(argtypes[i], argvalues[i]);
 			appendStringInfoString(&execbuf, quoted);
 		}
 	}
@@ -3666,6 +3692,7 @@ tdsFetchRemoteProcResult(void *handle, TupleTableSlot *slot)
 
 			slot->tts_values[i] = PointerGetDatum(cstring_to_text(cstring));
 			slot->tts_isnull[i] = false;
+			pfree(cstring);
 		}
 	}
 
@@ -3781,6 +3808,7 @@ tdsRemoteProcConsumeOutputSet(TdsRemoteProcHandle *hnd)
 				out->valtype = TEXTOID;
 				out->value = PointerGetDatum(cstring_to_text(cstring));
 				out->isnull = false;
+				pfree(cstring);
 			}
 
 			hnd->outputs = lappend(hnd->outputs, out);
@@ -3819,7 +3847,6 @@ tdsRemoteProcConsumeOutputSet(TdsRemoteProcHandle *hnd)
 				(errcode(ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION),
 				 errmsg("Failed to fetch remote procedure OUTPUT row")));
 }
-
 static void
 tdsRemoteProcDrainCurrentSet(TdsRemoteProcHandle *hnd, bool mark_more)
 {
