@@ -117,6 +117,22 @@ static void tds_clear_signals(void);
 static int tds_chkintr_func(void* vdbproc);
 static int tds_hndlintr_func(void* vdbproc);
 
+/*
+ * TdsRemoteProcHandle
+ *
+ * Per-execution state for FDW remote procedure calls.
+ *
+ * The handle tracks three channels of information:
+ * 1) active DB-Lib connection objects
+ * 2) current rowset iteration state for user-visible results
+ * 3) OUTPUT transport bookkeeping (__bbf_out_* detection/decoding)
+ *
+ * The object is owned by the remote-proc callback chain and is consumed by:
+ *   - tdsGetRemoteProcRuntimeResultDesc()
+ *   - tdsFetchRemoteProcResult()
+ *   - tdsGetRemoteProcOutputs()
+ *   - tdsRemoteProcHasMoreResults()
+ */
 typedef struct TdsRemoteProcHandle
 {
 	LOGINREC   *login;
@@ -3310,6 +3326,19 @@ tdsFormatRemoteExecArgLiteral(Oid argtype, Datum value)
 	}
 }
 
+/*
+ * tdsBuildRemoteExecSql
+ *
+ * Build a T-SQL batch for remote procedure invocation with optional OUTPUT
+ * parameter transport.
+ *
+ * For each OUTPUT argument, we synthesize @__bbf_out_N variables, bind them
+ * into EXEC ... OUTPUT, and optionally append a trailing SELECT that exposes
+ * these synthetic variables as a dedicated hidden result set.
+ *
+ * The hidden set is later consumed by tdsGetRemoteProcOutputs() and translated
+ * into RemoteProcOutputValue items for core utility-layer variable assignment.
+ */
 static char *
 tdsBuildRemoteExecSql(const char *remote_database,
 					  const char *remote_schema,
@@ -3525,6 +3554,16 @@ tdsRemoteProcCloseConnection(LOGINREC *login, DBPROCESS *dbproc)
 	tds_clear_signals();
 }
 
+/*
+ * tdsExecRemoteProc
+ *
+ * Execute a remote procedure call and initialize runtime state for subsequent
+ * result/OUTPUT consumption callbacks.
+ *
+ * This function does not materialize all results up front.  It executes the
+ * remote batch, positions dbproc at the first visible result candidate, and
+ * returns a handle that is iterated by Fetch/GetOutputs/HasMore callbacks.
+ */
 static void *
 tdsExecRemoteProc(Oid serverOid,
 			 Oid userid,
@@ -3576,17 +3615,17 @@ tdsExecRemoteProc(Oid serverOid,
 
 	tdsRemoteProcOpenConnection(serverOid, userid, &option_set, &h->login, &h->dbproc);
 
-	exec_sql = tdsBuildRemoteExecSql(remote_database,
-								remote_schema,
-								remote_routine,
-								nargs,
-								argnames,
-								argtypes,
-								argisout,
-								argvalues,
-								argnulls,
-								false,
-								true);
+	exec_sql = tdsBuildRemoteExecSql(remote_database, // TODO: 重构为 token 流式远端调用，避免 SQL 注入风险
+									 remote_schema,
+									 remote_routine,
+									 nargs,
+									 argnames,
+									 argtypes,
+									 argisout,
+									 argvalues,
+									 argnulls,
+									 false,
+									 true);
 
 	if ((erc = dbsetopt(h->dbproc, DBTEXTSIZE, "2147483647", -1)) == FAIL)
 		ereport(WARNING,
@@ -3863,6 +3902,15 @@ tdsRemoteProcDrainCurrentSet(TdsRemoteProcHandle *hnd, bool mark_more)
 	}
 }
 
+/*
+ * tdsGetRemoteProcOutputs
+ *
+ * Drain remaining remote procedure results and collect OUTPUT transport values.
+ *
+ * User-visible rowsets are ignored/drained in this phase; only synthetic
+ * __bbf_out_* result sets are decoded into RemoteProcOutputValue entries.
+ * The function also finalizes connection cleanup for this handle.
+ */
 static List *
 tdsGetRemoteProcOutputs(void *handle)
 {
@@ -3915,6 +3963,14 @@ tdsGetRemoteProcOutputs(void *handle)
 	return h->outputs;
 }
 
+/*
+ * tdsRemoteProcHasMoreResults
+ *
+ * Report whether additional visible result sets remain after the current one.
+ *
+ * This callback is used by core utility execution to enforce the current
+ * single-visible-result-set contract for remote procedure calls.
+ */
 static bool
 tdsRemoteProcHasMoreResults(void *handle)
 {
