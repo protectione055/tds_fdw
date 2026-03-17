@@ -125,7 +125,7 @@ static int tds_hndlintr_func(void* vdbproc);
  * The handle tracks three channels of information:
  * 1) active DB-Lib connection objects
  * 2) current rowset iteration state for user-visible results
- * 3) OUTPUT transport bookkeeping (__bbf_out_* detection/decoding)
+ * 3) RPC OUTPUT/return-status collection bookkeeping
  *
  * The object is owned by the remote-proc callback chain and is consumed by:
  *   - tdsGetRemoteProcRuntimeResultDesc()
@@ -144,27 +144,36 @@ typedef struct TdsRemoteProcHandle
 	bool		has_return_status_target;
 	bool			current_result_exhausted;
 	int			nargs;
+	int			proc_nargs;
 	const Oid *argtypes;
+	const char *const *argnames;
 	const bool *argisout;
 	int			noutargs;
 	int		   *out_arg_indexes;
+	int			return_status_arg_index;
 	List	   *outputs;
 	bool			outputs_fetched;
 } TdsRemoteProcHandle;
 
-static void tdsAppendBracketQuotedIdent(StringInfo buf, const char *ident);
-static const char *tdsGetRemoteVarTypeForOid(Oid typeoid);
-static char *tdsBuildRemoteExecSql(const char *remote_database,
-									 const char *remote_schema,
-									 const char *remote_routine,
-									 int nargs,
-									 const char *const *argnames,
-									 const Oid *argtypes,
-									 const bool *argisout,
-									 const Datum *argvalues,
-									 const bool *argnulls,
-									 bool use_null_args,
-									 bool append_output_select);
+static char *tdsBuildRemoteRpcName(const char *remote_database,
+								 const char *remote_schema,
+								 const char *remote_routine);
+static RETCODE tdsBindRemoteProcRpcParam(DBPROCESS *dbproc,
+								  const char *argname,
+								  Oid argtype,
+								  bool is_output_arg,
+								  Datum argvalue,
+								  bool isnull);
+static RETCODE tdsExecRemoteProcRpc(DBPROCESS *dbproc,
+								 const char *remote_database,
+								 const char *remote_schema,
+								 const char *remote_routine,
+								 int nargs,
+								 const char *const *argnames,
+								 const Oid *argtypes,
+								 const bool *argisout,
+								 const Datum *argvalues,
+								 const bool *argnulls);
 static void tdsRemoteProcOpenConnection(Oid serverOid,
 									Oid userid,
 									TdsFdwOptionSet *option_set,
@@ -187,9 +196,17 @@ static TupleDesc tdsGetRemoteProcRuntimeResultDesc(void *handle);
 static bool tdsFetchRemoteProcResult(void *handle, TupleTableSlot *slot);
 static List *tdsGetRemoteProcOutputs(void *handle);
 static bool tdsRemoteProcHasMoreResults(void *handle);
-static bool tdsRemoteProcResultSetIsOutput(TdsRemoteProcHandle *hnd);
-static void tdsRemoteProcConsumeOutputSet(TdsRemoteProcHandle *hnd);
 static void tdsRemoteProcDrainCurrentSet(TdsRemoteProcHandle *hnd, bool mark_more);
+static void tdsAppendRemoteProcOutputValue(TdsRemoteProcHandle *hnd,
+									  int arg_index,
+									  int srctype,
+									  const BYTE *src,
+									  DBINT srclen);
+static void tdsRemoteProcCollectRpcOutputs(TdsRemoteProcHandle *hnd);
+static int tdsRemoteProcResolveOutputArgIndex(TdsRemoteProcHandle *hnd,
+										 const char *retname,
+										 int fallback_ordinal);
+static bool tdsRemoteProcArgNameMatches(const char *argname, const char *retname);
 
 /* Executes server query */
 static bool
@@ -3272,232 +3289,242 @@ cleanup:
 	return (erc == SUCCEED);
 }
 
-static void
-tdsAppendBracketQuotedIdent(StringInfo buf, const char *ident)
-{
-	const char *p;
-
-	appendStringInfoChar(buf, '[');
-	for (p = ident; *p != '\0'; p++)
-	{
-		if (*p == ']')
-			appendStringInfoString(buf, "]]"
-									);
-		else
-			appendStringInfoChar(buf, *p);
-	}
-	appendStringInfoChar(buf, ']');
-}
-
 static char *
-tdsFormatRemoteExecArgLiteral(Oid argtype, Datum value)
+tdsBuildRemoteRpcName(const char *remote_database,
+					 const char *remote_schema,
+					 const char *remote_routine)
 {
-	if (argtype == BOOLOID)
-	{
-		if (DatumGetBool(value))
-			return pstrdup("1");
-		return pstrdup("0");
-	}
-
-	if (argtype == BYTEAOID)
-	{
-		bytea	  *bytes = DatumGetByteaPP(value);
-		int			len = VARSIZE_ANY_EXHDR(bytes);
-		char	   *data = VARDATA_ANY(bytes);
-		StringInfoData hex;
-		int			i;
-
-		initStringInfo(&hex);
-		appendStringInfoString(&hex, "0x");
-		for (i = 0; i < len; i++)
-			appendStringInfo(&hex, "%02X", (unsigned char) data[i]);
-
-		return hex.data;
-	}
-
-	{
-		Oid			 outputfunc;
-		bool		 typisvarlena;
-		char		*external;
-
-		getTypeOutputInfo(argtype, &outputfunc, &typisvarlena);
-		external = OidOutputFunctionCall(outputfunc, value);
-		return quote_literal_cstr(external);
-	}
-}
-
-/*
- * tdsBuildRemoteExecSql
- *
- * Build a T-SQL batch for remote procedure invocation with optional OUTPUT
- * parameter transport.
- *
- * For each OUTPUT argument, we synthesize @__bbf_out_N variables, bind them
- * into EXEC ... OUTPUT, and optionally append a trailing SELECT that exposes
- * these synthetic variables as a dedicated hidden result set.
- *
- * The hidden set is later consumed by tdsGetRemoteProcOutputs() and translated
- * into RemoteProcOutputValue items for core utility-layer variable assignment.
- */
-static char *
-tdsBuildRemoteExecSql(const char *remote_database,
-					  const char *remote_schema,
-					  const char *remote_routine,
-					  int nargs,
-					  const char *const *argnames,
-					  const Oid *argtypes,
-					  const bool *argisout,
-					  const Datum *argvalues,
-					  const bool *argnulls,
-					  bool use_null_args,
-					  bool append_output_select)
-{
-	StringInfoData preamble;
-	StringInfoData execbuf;
-	StringInfoData tail;
 	StringInfoData buf;
-	int			 i;
-	bool		 has_output_args = false;
-
-	initStringInfo(&preamble);
-	initStringInfo(&execbuf);
-	initStringInfo(&tail);
-
-	for (i = 0; i < nargs; i++)
-	{
-		bool		is_output_arg = (argisout && argisout[i]);
-		const char *var_decl_type;
-
-		if (!is_output_arg)
-			continue;
-
-		has_output_args = true;
-		var_decl_type = tdsGetRemoteVarTypeForOid(argtypes[i]);
-		appendStringInfo(&preamble,
-						 "DECLARE @__bbf_out_%d %s; ",
-						 i + 1,
-						 var_decl_type);
-
-		if (!use_null_args && !(argnulls && argnulls[i]))
-		{
-			char		*quoted;
-
-			quoted = tdsFormatRemoteExecArgLiteral(argtypes[i], argvalues[i]);
-			appendStringInfo(&preamble,
-							 "SET @__bbf_out_%d = CAST(%s AS %s); ",
-							 i + 1,
-							 quoted,
-							 var_decl_type);
-		}
-	}
-
-	appendStringInfoString(&execbuf, "EXEC ");
-	tdsAppendBracketQuotedIdent(&execbuf, remote_database);
-	appendStringInfoChar(&execbuf, '.');
-	tdsAppendBracketQuotedIdent(&execbuf, remote_schema);
-	appendStringInfoChar(&execbuf, '.');
-	tdsAppendBracketQuotedIdent(&execbuf, remote_routine);
-
-	for (i = 0; i < nargs; i++)
-	{
-		bool		is_output_arg = (argisout && argisout[i]);
-
-		if (i == 0)
-			appendStringInfoChar(&execbuf, ' ');
-		else
-			appendStringInfoString(&execbuf, ", ");
-
-		if (argnames && argnames[i] != NULL)
-		{
-			const char *argname = argnames[i];
-
-			if (argname[0] == '@')
-				argname++;
-
-			appendStringInfo(&execbuf, "@%s = ", argname);
-		}
-
-		if (is_output_arg)
-		{
-			appendStringInfo(&execbuf, "@__bbf_out_%d OUTPUT", i + 1);
-			continue;
-		}
-
-		if (use_null_args || (argnulls && argnulls[i]))
-			appendStringInfoString(&execbuf, "NULL");
-		else
-		{
-			char		*quoted;
-
-			quoted = tdsFormatRemoteExecArgLiteral(argtypes[i], argvalues[i]);
-			appendStringInfoString(&execbuf, quoted);
-		}
-	}
-
-	if (append_output_select && has_output_args)
-	{
-		appendStringInfoString(&tail, "; SELECT ");
-		for (i = 0; i < nargs; i++)
-		{
-			if (!(argisout && argisout[i]))
-				continue;
-
-			if (tail.len > (int) strlen("; SELECT "))
-				appendStringInfoString(&tail, ", ");
-
-			appendStringInfo(&tail,
-							 "@__bbf_out_%d AS [__bbf_out_%d]",
-							 i + 1,
-							 i + 1);
-		}
-	}
 
 	initStringInfo(&buf);
-	appendStringInfoString(&buf, preamble.data);
-	appendStringInfoString(&buf, execbuf.data);
-	appendStringInfoString(&buf, tail.data);
+	appendStringInfo(&buf, "%s.%s.%s",
+					 remote_database,
+					 remote_schema,
+					 remote_routine);
 
 	return buf.data;
 }
 
-static const char *
-tdsGetRemoteVarTypeForOid(Oid typeoid)
+static void
+tdsDescribeRemoteRpcNullParam(Oid argtype, int *dbtype, DBINT *maxlen)
 {
-	switch (typeoid)
+	switch (argtype)
 	{
 		case BOOLOID:
-			return "bit";
+			*dbtype = SYBBITN;
+			*maxlen = 1;
+			break;
 		case INT2OID:
-			return "smallint";
+			*dbtype = SYBINTN;
+			*maxlen = 2;
+			break;
 		case INT4OID:
-			return "int";
+			*dbtype = SYBINTN;
+			*maxlen = 4;
+			break;
 		case INT8OID:
-			return "bigint";
+			*dbtype = SYBINTN;
+			*maxlen = 8;
+			break;
 		case FLOAT4OID:
-			return "real";
+			*dbtype = SYBFLTN;
+			*maxlen = sizeof(DBREAL);
+			break;
 		case FLOAT8OID:
-			return "float";
-		case NUMERICOID:
-			return "numeric(38, 10)";
-		case DATEOID:
-			return "date";
-		case TIMEOID:
-			return "time";
-		case TIMESTAMPOID:
-			return "datetime2";
-		case TIMESTAMPTZOID:
-			return "datetimeoffset";
-		case UUIDOID:
-			return "uniqueidentifier";
+			*dbtype = SYBFLTN;
+			*maxlen = sizeof(DBFLT8);
+			break;
 		case BYTEAOID:
-			return "varbinary(max)";
-		case BPCHAROID:
-		case VARCHAROID:
-		case TEXTOID:
-		case NAMEOID:
+			*dbtype = SYBVARBINARY;
+			*maxlen = 1;
+			break;
 		default:
-			return "nvarchar(max)";
+			*dbtype = SYBVARCHAR;
+			*maxlen = 1;
+			break;
 	}
+}
+
+/*
+ * Audit note for the supported FreeTDS DB-Library environment:
+ * - procedure identity is initialized with dbrpcinit()
+ * - input/OUTPUT direction is bound per parameter with dbrpcparam()
+ * - dispatch is performed with dbrpcsend() + dbsqlok()
+ * - OUTPUT values are retrieved with dbnumrets()/dbretname()/dbretdata()
+ * - return status is retrieved with dbretstatus()
+ */
+static RETCODE
+tdsBindRemoteProcRpcParam(DBPROCESS *dbproc,
+					  const char *argname,
+					  Oid argtype,
+					  bool is_output_arg,
+					  Datum argvalue,
+					  bool isnull)
+{
+	char	   *rpc_param_name = NULL;
+	BYTE		status = is_output_arg ? DBRPCRETURN : 0;
+	int			dbtype;
+	DBINT		maxlen;
+	DBINT		datalen;
+	BYTE	   *value;
+
+	if (argname != NULL)
+	{
+		if (argname[0] == '@')
+			rpc_param_name = pstrdup(argname);
+		else
+			rpc_param_name = psprintf("@%s", argname);
+	}
+
+	if (isnull)
+	{
+		tdsDescribeRemoteRpcNullParam(argtype, &dbtype, &maxlen);
+		value = NULL;
+		datalen = 0;
+	}
+	else
+	{
+		switch (argtype)
+		{
+			case BOOLOID:
+				{
+					DBBIT *bitval = palloc(sizeof(DBBIT));
+
+					*bitval = DatumGetBool(argvalue) ? 1 : 0;
+					dbtype = SYBBITN;
+					maxlen = sizeof(DBBIT);
+					datalen = sizeof(DBBIT);
+					value = (BYTE *) bitval;
+					break;
+				}
+			case INT2OID:
+				{
+					DBSMALLINT *intval = palloc(sizeof(DBSMALLINT));
+
+					*intval = DatumGetInt16(argvalue);
+					dbtype = SYBINT2;
+					maxlen = -1;
+					datalen = sizeof(DBSMALLINT);
+					value = (BYTE *) intval;
+					break;
+				}
+			case INT4OID:
+				{
+					DBINT *intval = palloc(sizeof(DBINT));
+
+					*intval = DatumGetInt32(argvalue);
+					dbtype = SYBINT4;
+					maxlen = -1;
+					datalen = sizeof(DBINT);
+					value = (BYTE *) intval;
+					break;
+				}
+			case INT8OID:
+				{
+					DBBIGINT *intval = palloc(sizeof(DBBIGINT));
+
+					*intval = DatumGetInt64(argvalue);
+					dbtype = SYBINT8;
+					maxlen = -1;
+					datalen = sizeof(DBBIGINT);
+					value = (BYTE *) intval;
+					break;
+				}
+			case FLOAT4OID:
+				{
+					DBREAL *realval = palloc(sizeof(DBREAL));
+
+					*realval = DatumGetFloat4(argvalue);
+					dbtype = SYBREAL;
+					maxlen = -1;
+					datalen = sizeof(DBREAL);
+					value = (BYTE *) realval;
+					break;
+				}
+			case FLOAT8OID:
+				{
+					DBFLT8 *fltval = palloc(sizeof(DBFLT8));
+
+					*fltval = DatumGetFloat8(argvalue);
+					dbtype = SYBFLT8;
+					maxlen = -1;
+					datalen = sizeof(DBFLT8);
+					value = (BYTE *) fltval;
+					break;
+				}
+			case BYTEAOID:
+				{
+					bytea *bytes = DatumGetByteaPP(argvalue);
+
+					dbtype = SYBVARBINARY;
+					maxlen = VARSIZE_ANY_EXHDR(bytes);
+					datalen = maxlen;
+					value = (BYTE *) VARDATA_ANY(bytes);
+					break;
+				}
+			default:
+				{
+					Oid			 outputfunc;
+					bool		 typisvarlena;
+					char		*external;
+
+					getTypeOutputInfo(argtype, &outputfunc, &typisvarlena);
+					external = OidOutputFunctionCall(outputfunc, argvalue);
+					dbtype = SYBVARCHAR;
+					maxlen = strlen(external);
+					datalen = maxlen;
+					value = (BYTE *) external;
+					break;
+				}
+		}
+	}
+
+	return dbrpcparam(dbproc,
+						rpc_param_name,
+						status,
+						dbtype,
+						maxlen,
+						datalen,
+						value);
+}
+
+static RETCODE
+tdsExecRemoteProcRpc(DBPROCESS *dbproc,
+					 const char *remote_database,
+					 const char *remote_schema,
+					 const char *remote_routine,
+					 int nargs,
+					 const char *const *argnames,
+					 const Oid *argtypes,
+					 const bool *argisout,
+					 const Datum *argvalues,
+					 const bool *argnulls)
+{
+	char	   *rpcname;
+	int			i;
+
+	rpcname = tdsBuildRemoteRpcName(remote_database,
+							  remote_schema,
+							  remote_routine);
+
+	if (dbrpcinit(dbproc, rpcname, 0) == FAIL)
+		return FAIL;
+
+	for (i = 0; i < nargs; i++)
+	{
+		if (tdsBindRemoteProcRpcParam(dbproc,
+								 argnames ? argnames[i] : NULL,
+								 argtypes[i],
+								 argisout && argisout[i],
+								 argvalues[i],
+								 argnulls && argnulls[i]) == FAIL)
+			return FAIL;
+	}
+
+	if (dbrpcsend(dbproc) == FAIL)
+		return FAIL;
+
+	return dbsqlok(dbproc);
 }
 
 static void
@@ -3580,7 +3607,6 @@ tdsExecRemoteProc(Oid serverOid,
 {
 	TdsFdwOptionSet option_set;
 	TdsRemoteProcHandle *h;
-	char		*exec_sql;
 	RETCODE		erc;
 	int			i;
 
@@ -3588,11 +3614,14 @@ tdsExecRemoteProc(Oid serverOid,
 	h->has_return_status_target = has_return_status_target;
 	h->current_result_exhausted = false;
 	h->nargs = nargs;
+	h->proc_nargs = nargs;
 	h->argtypes = argtypes;
+	h->argnames = argnames;
 	h->argisout = argisout;
 	h->noutargs = 0;
 	h->outputs = NIL;
 	h->outputs_fetched = false;
+	h->return_status_arg_index = -1;
 
 	for (i = 0; i < nargs; i++)
 	{
@@ -3615,7 +3644,13 @@ tdsExecRemoteProc(Oid serverOid,
 
 	tdsRemoteProcOpenConnection(serverOid, userid, &option_set, &h->login, &h->dbproc);
 
-	exec_sql = tdsBuildRemoteExecSql(remote_database, // TODO: 重构为 token 流式远端调用，避免 SQL 注入风险
+	if ((erc = dbsetopt(h->dbproc, DBTEXTSIZE, "2147483647", -1)) == FAIL)
+		ereport(WARNING,
+				(errcode(ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION),
+				 errmsg("Failed to set DBTEXTLIMIT server option, blob sizes may be truncated")));
+
+	if ((erc = tdsExecRemoteProcRpc(h->dbproc,
+									 remote_database,
 									 remote_schema,
 									 remote_routine,
 									 nargs,
@@ -3623,30 +3658,22 @@ tdsExecRemoteProc(Oid serverOid,
 									 argtypes,
 									 argisout,
 									 argvalues,
-									 argnulls,
-									 false,
-									 true);
-
-	if ((erc = dbsetopt(h->dbproc, DBTEXTSIZE, "2147483647", -1)) == FAIL)
-		ereport(WARNING,
-				(errcode(ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION),
-				 errmsg("Failed to set DBTEXTLIMIT server option, blob sizes may be truncated")));
-
-	if ((erc = dbcmd(h->dbproc, exec_sql)) == FAIL)
+									 argnulls)) == FAIL)
 		ereport(ERROR,
 				(errcode(ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION),
-				 errmsg("Failed to set current query to %s", exec_sql)));
-
-	if ((erc = dbsqlexec(h->dbproc)) == FAIL)
-		ereport(ERROR,
-				(errcode(ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION),
-				 errmsg("Failed to execute query %s", exec_sql)));
+				 errmsg("Failed to dispatch remote procedure %s.%s.%s through RPC",
+						remote_database,
+						remote_schema,
+						remote_routine)));
 
 	h->ret_code = dbresults(h->dbproc);
 	if (h->ret_code == FAIL)
 		ereport(ERROR,
 				(errcode(ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION),
-				 errmsg("Failed to get results from query %s", exec_sql)));
+				 errmsg("Failed to get results from remote procedure %s.%s.%s",
+						remote_database,
+						remote_schema,
+						remote_routine)));
 
 	while (h->ret_code == SUCCEED && dbnumcols(h->dbproc) == 0)
 	{
@@ -3654,7 +3681,10 @@ tdsExecRemoteProc(Oid serverOid,
 		if (h->ret_code == FAIL)
 			ereport(ERROR,
 					(errcode(ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION),
-					 errmsg("Failed to get results from query %s", exec_sql)));
+					 errmsg("Failed to advance results for remote procedure %s.%s.%s",
+							remote_database,
+							remote_schema,
+							remote_routine)));
 	}
 
 	if (h->ret_code == SUCCEED)
@@ -3675,17 +3705,6 @@ tdsFetchRemoteProcResult(void *handle, TupleTableSlot *slot)
 
 	if (h->ret_code != SUCCEED || h->ncols <= 0)
 		return false;
-
-	/*
-	 * __bbf_out_* rows are an internal transport for OUTPUT parameters.
-	 * They must not be pushed as user-visible rowsets.
-	 */
-	if (tdsRemoteProcResultSetIsOutput(h))
-	{
-		tdsRemoteProcConsumeOutputSet(h);
-		h->current_result_exhausted = true;
-		return false;
-	}
 
 	ret_code = dbnextrow(h->dbproc);
 	if (ret_code == NO_MORE_ROWS)
@@ -3755,12 +3774,6 @@ tdsGetRemoteProcRuntimeResultDesc(void *handle)
 	if (h == NULL || h->ret_code != SUCCEED || h->ncols <= 0 || h->dbproc == NULL)
 		return NULL;
 
-	/*
-	 * Do not expose synthetic OUTPUT transport columns as runtime rowsets.
-	 */
-	if (tdsRemoteProcResultSetIsOutput(h))
-		return NULL;
-
 	result_desc = CreateTemplateTupleDesc(h->ncols);
 	for (i = 1; i <= h->ncols; i++)
 	{
@@ -3779,113 +3792,6 @@ tdsGetRemoteProcRuntimeResultDesc(void *handle)
 
 	return BlessTupleDesc(result_desc);
 }
-
-static bool
-tdsRemoteProcResultSetIsOutput(TdsRemoteProcHandle *hnd)
-{
-	int			i;
-
-	if (hnd->noutargs <= 0 || dbnumcols(hnd->dbproc) != hnd->noutargs)
-		return false;
-
-	for (i = 0; i < hnd->noutargs; i++)
-	{
-		char		expected_colname[32];
-		char		*actual_colname;
-
-		snprintf(expected_colname, sizeof(expected_colname), "__bbf_out_%d", hnd->out_arg_indexes[i] + 1);
-		actual_colname = dbcolname(hnd->dbproc, i + 1);
-
-		if (actual_colname == NULL || strcmp(actual_colname, expected_colname) != 0)
-			return false;
-	}
-
-	return true;
-}
-
-static void
-tdsRemoteProcConsumeOutputSet(TdsRemoteProcHandle *hnd)
-{
-	int			resultcode;
-	int			i;
-
-	resultcode = dbnextrow(hnd->dbproc);
-	if (resultcode == REG_ROW)
-	{
-		for (i = 0; i < hnd->noutargs; i++)
-		{
-			int			arg_index = hnd->out_arg_indexes[i];
-			DBINT		srclen;
-			BYTE	   *src;
-			int			srctype;
-			RemoteProcOutputValue *out;
-
-			srclen = dbdatlen(hnd->dbproc, i + 1);
-			src = dbdata(hnd->dbproc, i + 1);
-			srctype = dbcoltype(hnd->dbproc, i + 1);
-
-			out = palloc0(sizeof(RemoteProcOutputValue));
-			out->arg_index = arg_index;
-			out->valtypmod = -1;
-
-			if (srclen == 0 && src == NULL)
-			{
-				out->isnull = true;
-				out->valtype = (hnd->argtypes && hnd->argtypes[arg_index] != InvalidOid)
-					? hnd->argtypes[arg_index]
-					: TEXTOID;
-			}
-			else
-			{
-				char *cstring = tdsConvertToCString(hnd->dbproc, srctype, src, srclen);
-
-				if (cstring == NULL)
-					ereport(ERROR,
-							(errcode(ERRCODE_FDW_INVALID_ATTRIBUTE_VALUE),
-							 errmsg("failed to convert remote procedure OUTPUT value")));
-
-				out->valtype = TEXTOID;
-				out->value = PointerGetDatum(cstring_to_text(cstring));
-				out->isnull = false;
-				pfree(cstring);
-			}
-
-			hnd->outputs = lappend(hnd->outputs, out);
-		}
-
-		while ((resultcode = dbnextrow(hnd->dbproc)) != NO_MORE_ROWS)
-		{
-			if (resultcode == BUF_FULL)
-				ereport(ERROR,
-						(errcode(ERRCODE_FDW_OUT_OF_MEMORY),
-						 errmsg("Buffer filled while fetching remote procedure OUTPUT row")));
-			hnd->has_more_results = true;
-		}
-	}
-	else if (resultcode == NO_MORE_ROWS)
-	{
-		for (i = 0; i < hnd->noutargs; i++)
-		{
-			RemoteProcOutputValue *out = palloc0(sizeof(RemoteProcOutputValue));
-
-			out->arg_index = hnd->out_arg_indexes[i];
-			out->valtype = (hnd->argtypes && hnd->argtypes[out->arg_index] != InvalidOid)
-				? hnd->argtypes[out->arg_index]
-				: TEXTOID;
-			out->valtypmod = -1;
-			out->isnull = true;
-			hnd->outputs = lappend(hnd->outputs, out);
-		}
-	}
-	else if (resultcode == BUF_FULL)
-		ereport(ERROR,
-				(errcode(ERRCODE_FDW_OUT_OF_MEMORY),
-				 errmsg("Buffer filled while fetching remote procedure OUTPUT row")));
-	else
-		ereport(ERROR,
-				(errcode(ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION),
-				 errmsg("Failed to fetch remote procedure OUTPUT row")));
-}
 static void
 tdsRemoteProcDrainCurrentSet(TdsRemoteProcHandle *hnd, bool mark_more)
 {
@@ -3902,14 +3808,172 @@ tdsRemoteProcDrainCurrentSet(TdsRemoteProcHandle *hnd, bool mark_more)
 	}
 }
 
+static bool
+tdsRemoteProcArgNameMatches(const char *argname, const char *retname)
+{
+	if (argname == NULL || retname == NULL)
+		return false;
+
+	if (argname[0] == '@')
+		argname++;
+	if (retname[0] == '@')
+		retname++;
+
+	return pg_strcasecmp(argname, retname) == 0;
+}
+
+static int
+tdsRemoteProcResolveOutputArgIndex(TdsRemoteProcHandle *hnd,
+									  const char *retname,
+									  int fallback_ordinal)
+{
+	int			i;
+
+	if (retname != NULL && retname[0] != '\0' && hnd->argnames != NULL)
+	{
+		for (i = 0; i < hnd->proc_nargs; i++)
+		{
+			if (!(hnd->argisout && hnd->argisout[i]))
+				continue;
+			if (tdsRemoteProcArgNameMatches(hnd->argnames[i], retname))
+				return i;
+		}
+	}
+
+	for (i = 0; i < hnd->proc_nargs; i++)
+	{
+		if (!(hnd->argisout && hnd->argisout[i]))
+			continue;
+		if (fallback_ordinal-- == 0)
+			return i;
+	}
+
+	return -1;
+}
+
+static void
+tdsAppendRemoteProcOutputValue(TdsRemoteProcHandle *hnd,
+								 int arg_index,
+								 int srctype,
+								 const BYTE *src,
+								 DBINT srclen)
+{
+	RemoteProcOutputValue *out;
+	Oid			expected_type = TEXTOID;
+
+	out = palloc0(sizeof(RemoteProcOutputValue));
+	out->arg_index = arg_index;
+	out->is_return_status = false;
+	out->valtypmod = -1;
+
+	if (arg_index >= 0 && hnd->argtypes != NULL && hnd->argtypes[arg_index] != InvalidOid)
+		expected_type = hnd->argtypes[arg_index];
+
+	if (srclen == 0 && src == NULL)
+	{
+		out->isnull = true;
+		out->valtype = expected_type;
+		hnd->outputs = lappend(hnd->outputs, out);
+		return;
+	}
+
+	if (expected_type == BYTEAOID)
+	{
+		bytea	   *bytes = (bytea *) palloc(srclen + VARHDRSZ);
+
+		SET_VARSIZE(bytes, srclen + VARHDRSZ);
+		memcpy(VARDATA(bytes), src, srclen);
+		out->valtype = BYTEAOID;
+		out->value = PointerGetDatum(bytes);
+		out->isnull = false;
+	}
+	else
+	{
+		char	   *cstring = tdsConvertToCString(hnd->dbproc, srctype, src, srclen);
+
+		if (cstring == NULL)
+			ereport(ERROR,
+					(errcode(ERRCODE_FDW_INVALID_ATTRIBUTE_VALUE),
+					 errmsg("failed to convert remote procedure OUTPUT value")));
+
+		out->valtype = TEXTOID;
+		out->value = PointerGetDatum(cstring_to_text(cstring));
+		out->isnull = false;
+		pfree(cstring);
+	}
+
+	hnd->outputs = lappend(hnd->outputs, out);
+}
+
+static void
+tdsRemoteProcCollectRpcOutputs(TdsRemoteProcHandle *hnd)
+{
+	bool	   *seen = NULL;
+	int			nrets;
+	int			i;
+
+	if (hnd->proc_nargs > 0)
+		seen = palloc0(sizeof(bool) * hnd->proc_nargs);
+
+	nrets = dbnumrets(hnd->dbproc);
+	for (i = 0; i < nrets; i++)
+	{
+		char	   *retname = dbretname(hnd->dbproc, i + 1);
+		int			arg_index;
+
+		arg_index = tdsRemoteProcResolveOutputArgIndex(hnd, retname, i);
+		if (arg_index < 0)
+			continue;
+
+		if (seen != NULL)
+			seen[arg_index] = true;
+
+		tdsAppendRemoteProcOutputValue(hnd,
+								 arg_index,
+								 dbrettype(hnd->dbproc, i + 1),
+								 dbretdata(hnd->dbproc, i + 1),
+								 dbretlen(hnd->dbproc, i + 1));
+	}
+
+	for (i = 0; i < hnd->proc_nargs; i++)
+	{
+		RemoteProcOutputValue *out;
+
+		if (!(hnd->argisout && hnd->argisout[i]))
+			continue;
+		if (seen != NULL && seen[i])
+			continue;
+
+		out = palloc0(sizeof(RemoteProcOutputValue));
+		out->arg_index = i;
+		out->is_return_status = false;
+		out->valtype = (hnd->argtypes && hnd->argtypes[i] != InvalidOid)
+			? hnd->argtypes[i]
+			: TEXTOID;
+		out->valtypmod = -1;
+		out->isnull = true;
+		hnd->outputs = lappend(hnd->outputs, out);
+	}
+
+	if (hnd->has_return_status_target)
+	{
+		RemoteProcOutputValue *out = palloc0(sizeof(RemoteProcOutputValue));
+
+		out->arg_index = -1;
+		out->is_return_status = true;
+		out->valtype = INT4OID;
+		out->valtypmod = -1;
+		out->value = Int32GetDatum((int32) dbretstatus(hnd->dbproc));
+		out->isnull = false;
+		hnd->outputs = lappend(hnd->outputs, out);
+	}
+}
+
 /*
  * tdsGetRemoteProcOutputs
  *
- * Drain remaining remote procedure results and collect OUTPUT transport values.
- *
- * User-visible rowsets are ignored/drained in this phase; only synthetic
- * __bbf_out_* result sets are decoded into RemoteProcOutputValue entries.
- * The function also finalizes connection cleanup for this handle.
+	 * Drain remaining remote procedure results, collect RPC OUTPUT values and
+	 * return status, then finalize connection cleanup for this handle.
  */
 static List *
 tdsGetRemoteProcOutputs(void *handle)
@@ -3932,11 +3996,7 @@ tdsGetRemoteProcOutputs(void *handle)
 
 	if (!h->current_result_exhausted && h->ret_code == SUCCEED && dbnumcols(h->dbproc) > 0)
 	{
-		if (tdsRemoteProcResultSetIsOutput(h))
-			tdsRemoteProcConsumeOutputSet(h);
-		else
-			tdsRemoteProcDrainCurrentSet(h, false);
-
+		tdsRemoteProcDrainCurrentSet(h, false);
 		h->current_result_exhausted = true;
 	}
 
@@ -3950,11 +4010,10 @@ tdsGetRemoteProcOutputs(void *handle)
 		if (erc != SUCCEED || dbnumcols(h->dbproc) <= 0)
 			continue;
 
-		if (tdsRemoteProcResultSetIsOutput(h))
-			tdsRemoteProcConsumeOutputSet(h);
-		else
-			tdsRemoteProcDrainCurrentSet(h, true);
+		tdsRemoteProcDrainCurrentSet(h, true);
 	}
+
+	tdsRemoteProcCollectRpcOutputs(h);
 
 	tdsRemoteProcCloseConnection(h->login, h->dbproc);
 	h->login = NULL;
