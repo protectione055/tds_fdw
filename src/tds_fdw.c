@@ -139,8 +139,6 @@ typedef struct TdsRemoteProcHandle
 	DBPROCESS  *dbproc;
 	int			ncols;
 	int			ret_code;
-	bool		checked_more_results;
-	bool		has_more_results;
 	bool		has_return_status_target;
 	bool			current_result_exhausted;
 	int			nargs;
@@ -196,7 +194,8 @@ static TupleDesc tdsGetRemoteProcRuntimeResultDesc(void *handle);
 static bool tdsFetchRemoteProcResult(void *handle, TupleTableSlot *slot);
 static List *tdsGetRemoteProcOutputs(void *handle);
 static bool tdsRemoteProcHasMoreResults(void *handle);
-static void tdsRemoteProcDrainCurrentSet(TdsRemoteProcHandle *hnd, bool mark_more);
+static RETCODE tdsRemoteProcAdvanceToNextVisibleResult(TdsRemoteProcHandle *hnd);
+static void tdsRemoteProcDrainCurrentSet(TdsRemoteProcHandle *hnd);
 static void tdsAppendRemoteProcOutputValue(TdsRemoteProcHandle *hnd,
 									  int arg_index,
 									  int srctype,
@@ -3612,7 +3611,7 @@ tdsExecRemoteProc(Oid serverOid,
 
 	h = palloc0(sizeof(TdsRemoteProcHandle));
 	h->has_return_status_target = has_return_status_target;
-	h->current_result_exhausted = false;
+	h->current_result_exhausted = true;
 	h->nargs = nargs;
 	h->proc_nargs = nargs;
 	h->argtypes = argtypes;
@@ -3666,31 +3665,14 @@ tdsExecRemoteProc(Oid serverOid,
 						remote_schema,
 						remote_routine)));
 
-	h->ret_code = dbresults(h->dbproc);
-	if (h->ret_code == FAIL)
+	erc = tdsRemoteProcAdvanceToNextVisibleResult(h);
+	if (erc == FAIL)
 		ereport(ERROR,
 				(errcode(ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION),
 				 errmsg("Failed to get results from remote procedure %s.%s.%s",
 						remote_database,
 						remote_schema,
 						remote_routine)));
-
-	while (h->ret_code == SUCCEED && dbnumcols(h->dbproc) == 0)
-	{
-		h->ret_code = dbresults(h->dbproc);
-		if (h->ret_code == FAIL)
-			ereport(ERROR,
-					(errcode(ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION),
-					 errmsg("Failed to advance results for remote procedure %s.%s.%s",
-							remote_database,
-							remote_schema,
-							remote_routine)));
-	}
-
-	if (h->ret_code == SUCCEED)
-		h->ncols = dbnumcols(h->dbproc);
-	else if (h->ret_code == NO_MORE_RESULTS)
-		h->ncols = 0;
 
 	return h;
 }
@@ -3792,8 +3774,31 @@ tdsGetRemoteProcRuntimeResultDesc(void *handle)
 
 	return BlessTupleDesc(result_desc);
 }
+
+static RETCODE
+tdsRemoteProcAdvanceToNextVisibleResult(TdsRemoteProcHandle *hnd)
+{
+	RETCODE		erc;
+
+	while ((erc = dbresults(hnd->dbproc)) == SUCCEED)
+	{
+		if (dbnumcols(hnd->dbproc) <= 0)
+			continue;
+
+		hnd->ret_code = SUCCEED;
+		hnd->ncols = dbnumcols(hnd->dbproc);
+		hnd->current_result_exhausted = false;
+		return SUCCEED;
+	}
+
+	hnd->ret_code = erc;
+	hnd->ncols = 0;
+	hnd->current_result_exhausted = true;
+	return erc;
+}
+
 static void
-tdsRemoteProcDrainCurrentSet(TdsRemoteProcHandle *hnd, bool mark_more)
+tdsRemoteProcDrainCurrentSet(TdsRemoteProcHandle *hnd)
 {
 	int resultcode;
 
@@ -3803,8 +3808,6 @@ tdsRemoteProcDrainCurrentSet(TdsRemoteProcHandle *hnd, bool mark_more)
 			ereport(ERROR,
 					(errcode(ERRCODE_FDW_OUT_OF_MEMORY),
 					 errmsg("Buffer filled while draining remote procedure result row")));
-		if (mark_more)
-			hnd->has_more_results = true;
 	}
 }
 
@@ -3972,8 +3975,9 @@ tdsRemoteProcCollectRpcOutputs(TdsRemoteProcHandle *hnd)
 /*
  * tdsGetRemoteProcOutputs
  *
-	 * Drain remaining remote procedure results, collect RPC OUTPUT values and
-	 * return status, then finalize connection cleanup for this handle.
+ * Drain any remaining protocol state after visible rowset iteration,
+ * collect RPC OUTPUT values and return status exactly once, then release
+ * connection resources for this handle.
  */
 static List *
 tdsGetRemoteProcOutputs(void *handle)
@@ -3988,15 +3992,13 @@ tdsGetRemoteProcOutputs(void *handle)
 		return h->outputs;
 
 	h->outputs_fetched = true;
-	h->checked_more_results = true;
-	h->has_more_results = false;
 
 	if (h->dbproc == NULL)
 		return h->outputs;
 
 	if (!h->current_result_exhausted && h->ret_code == SUCCEED && dbnumcols(h->dbproc) > 0)
 	{
-		tdsRemoteProcDrainCurrentSet(h, false);
+		tdsRemoteProcDrainCurrentSet(h);
 		h->current_result_exhausted = true;
 	}
 
@@ -4010,7 +4012,7 @@ tdsGetRemoteProcOutputs(void *handle)
 		if (erc != SUCCEED || dbnumcols(h->dbproc) <= 0)
 			continue;
 
-		tdsRemoteProcDrainCurrentSet(h, true);
+		tdsRemoteProcDrainCurrentSet(h);
 	}
 
 	tdsRemoteProcCollectRpcOutputs(h);
@@ -4025,10 +4027,11 @@ tdsGetRemoteProcOutputs(void *handle)
 /*
  * tdsRemoteProcHasMoreResults
  *
- * Report whether additional visible result sets remain after the current one.
+ * Report whether another visible rowset remains after the current one.
  *
- * This callback is used by core utility execution to enforce the current
- * single-visible-result-set contract for remote procedure calls.
+ * Core uses this as the transition point between client-visible rowsets.
+ * DONE/rowcount tokens may be consumed here, but final OUTPUT and return
+ * status harvesting is deferred to tdsGetRemoteProcOutputs().
  */
 static bool
 tdsRemoteProcHasMoreResults(void *handle)
@@ -4039,30 +4042,21 @@ tdsRemoteProcHasMoreResults(void *handle)
 	if (h == NULL)
 		return false;
 
-	if (h->checked_more_results)
-		return h->has_more_results;
-
 	if (h->dbproc == NULL)
 		return false;
 
-	h->checked_more_results = true;
-	h->has_more_results = false;
+	if (h->ret_code == SUCCEED && h->ncols > 0 && !h->current_result_exhausted)
+		ereport(ERROR,
+				(errcode(ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION),
+				 errmsg("attempted to advance remote procedure results before exhausting the current result set")));
 
-	while ((erc = dbresults(h->dbproc)) != NO_MORE_RESULTS)
-	{
-		if (erc == FAIL)
-			ereport(ERROR,
-					(errcode(ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION),
-					 errmsg("Failed while checking additional remote procedure result sets")));
+	erc = tdsRemoteProcAdvanceToNextVisibleResult(h);
+	if (erc == FAIL)
+		ereport(ERROR,
+				(errcode(ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION),
+				 errmsg("Failed while checking additional remote procedure result sets")));
 
-		if (erc == SUCCEED && dbnumcols(h->dbproc) > 0)
-		{
-			h->has_more_results = true;
-			break;
-		}
-	}
-
-	return h->has_more_results;
+	return (erc == SUCCEED);
 }
 
 #ifdef IMPORT_API
