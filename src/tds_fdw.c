@@ -3478,6 +3478,14 @@ tdsBindRemoteProcRpcParam(DBPROCESS *dbproc,
 		}
 	}
 
+	/*
+	 * FreeTDS DB-Library only uses maxlen for OUTPUT parameters. For input
+	 * parameters, maxlen must be -1 for non-NULL values and 0 for NULLs;
+	 * the actual input size is conveyed via datalen.
+	 */
+	if (!is_output_arg)
+		maxlen = isnull ? 0 : -1;
+
 	return dbrpcparam(dbproc,
 						rpc_param_name,
 						status,
@@ -4153,8 +4161,6 @@ tdsImportSqlServerSchema(ImportForeignSchemaStmt *stmt, DBPROCESS  *dbproc,
 	/*
 	 * Fetch all table data from this schema, possibly restricted by
 	 * EXCEPT or LIMIT TO.  (We don't actually need to pay any attention
-						(errcode(ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION),
-						 errmsg("Failed to check for additional remote procedure result sets")));
 	 * to EXCEPT/LIMIT TO here, because the core code will filter the
 	 * statements we return according to those lists anyway.  But it
 	 * should save a few cycles to not process excluded tables in the
