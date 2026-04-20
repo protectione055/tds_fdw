@@ -49,7 +49,6 @@ void tdsOptionSetInit(TdsFdwOptionSet* option_set);
 
 static UserMapping *tdsGetUserMappingIfExists(Oid userid, Oid serverid);
 static bool tdsUserMappingHasRequiredCredentials(UserMapping *mapping);
-static UserMapping *tdsGetCredentialBearingUserMapping(Oid serverid);
 
 static UserMapping *
 tdsGetUserMappingIfExists(Oid userid, Oid serverid)
@@ -114,12 +113,15 @@ tdsUserMappingHasRequiredCredentials(UserMapping *mapping)
 	return has_username && has_password;
 }
 
-static UserMapping *
-tdsGetCredentialBearingUserMapping(Oid serverid)
+UserMapping *
+tdsGetCredentialBearingUserMapping(Oid serverid, Oid userid)
 {
 	UserMapping *mapping;
 
-	mapping = tdsGetUserMappingIfExists(GetUserId(), serverid);
+	if (!OidIsValid(userid))
+		userid = GetUserId();
+
+	mapping = tdsGetUserMappingIfExists(userid, serverid);
 	if (tdsUserMappingHasRequiredCredentials(mapping))
 		return mapping;
 
@@ -232,6 +234,18 @@ void tdsValidateOptions(List *options_list, Oid context, TdsFdwOptionSet* option
 
 void tdsGetForeignServerOptionsFromCatalog(Oid foreignserverid, TdsFdwOptionSet* option_set)
 {
+	tdsGetForeignServerOptionsFromCatalogByUser(foreignserverid,
+							 GetUserId(),
+							 option_set,
+							 NULL);
+}
+
+void
+tdsGetForeignServerOptionsFromCatalogByUser(Oid foreignserverid,
+						 Oid userid,
+						 TdsFdwOptionSet* option_set,
+						 UserMapping **mapping)
+{
 	ForeignServer *f_server;
 	UserMapping *f_mapping;
 
@@ -244,7 +258,7 @@ void tdsGetForeignServerOptionsFromCatalog(Oid foreignserverid, TdsFdwOptionSet*
 	tdsOptionSetInit(option_set);
 
 	f_server = GetForeignServer(foreignserverid);
-	f_mapping = tdsGetCredentialBearingUserMapping(foreignserverid);
+	f_mapping = tdsGetCredentialBearingUserMapping(foreignserverid, userid);
 	if (f_mapping == NULL)
 		ereport(ERROR,
 				(errcode(ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION),
@@ -257,6 +271,9 @@ void tdsGetForeignServerOptionsFromCatalog(Oid foreignserverid, TdsFdwOptionSet*
 	tdsGetUserMappingOptions(f_mapping->options, option_set);
 
 	tdsSetDefaultOptions(option_set);
+
+	if (mapping != NULL)
+		*mapping = f_mapping;
 
 	#ifdef DEBUG
 		ereport(NOTICE,
@@ -283,7 +300,8 @@ void tdsGetForeignTableOptionsFromCatalog(Oid foreigntableid, TdsFdwOptionSet* o
 	
 	f_table = GetForeignTable(foreigntableid);
 	f_server = GetForeignServer(f_table->serverid);
-	f_mapping = tdsGetCredentialBearingUserMapping(f_table->serverid);
+	f_mapping = tdsGetCredentialBearingUserMapping(f_table->serverid,
+							  GetUserId());
 	if (f_mapping == NULL)
 		ereport(ERROR,
 				(errcode(ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION),
