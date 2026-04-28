@@ -3,6 +3,7 @@
 #define OPTIONS_H
 
 #include "postgres.h"
+#include "foreign/foreign.h"
 
 /* valid options follow this format */
 
@@ -40,7 +41,12 @@ typedef struct TdsFdwOptionSet
 
 void tdsValidateOptions(List *options_list, Oid context, TdsFdwOptionSet* option_set);
 void tdsGetForeignServerOptionsFromCatalog(Oid foreignserverid, TdsFdwOptionSet* option_set);
+void tdsGetForeignServerOptionsFromCatalogByUser(Oid foreignserverid,
+							 Oid userid,
+							 TdsFdwOptionSet* option_set,
+							 UserMapping **mapping);
 void tdsGetForeignTableOptionsFromCatalog(Oid foreigntableid, TdsFdwOptionSet* option_set);
+UserMapping *tdsGetCredentialBearingUserMapping(Oid serverid, Oid userid);
 void tdsValidateOptionSet(TdsFdwOptionSet* option_set);
 
 #endif

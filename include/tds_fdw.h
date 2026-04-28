@@ -192,12 +192,16 @@ double tdsGetRowCountExecute(TdsFdwOptionSet* option_set, LOGINREC *login, DBPRO
 double tdsGetStartupCost(TdsFdwOptionSet* option_set);
 void tdsGetColumnMetadata(ForeignScanState *node, TdsFdwOptionSet *option_set);
 char* tdsConvertToCString(DBPROCESS* dbproc, int srctype, const BYTE* src, DBINT srclen);
+bool tdsIsSqlServer(DBPROCESS *dbproc);
+void tds_clear_signals(void);
+extern bool tds_remote_proc_query_timed_out;
 #if (PG_VERSION_NUM >= 90400)
 int tdsDatetimeToDatum(DBPROCESS *dbproc, DBDATETIME *src, Datum *datetime_out);
 #endif
 
 /* Helper functions for DB-Library API */
 
+int tds_err_capture(DBPROCESS *dbproc, int severity, int dberr, int oserr, char *dberrstr, char *oserrstr);
 int tds_err_handler(DBPROCESS *dbproc, int severity, int dberr, int oserr, char *dberrstr, char *oserrstr);
 int tds_notice_msg_handler(DBPROCESS *dbproc, DBINT msgno, int msgstate, int severity, char *msgtext, char *svr_name, char *proc_name, int line);
 int tds_blackhole_msg_handler(DBPROCESS *dbproc, DBINT msgno, int msgstate, int severity, char *msgtext, char *svr_name, char *proc_name, int line);
