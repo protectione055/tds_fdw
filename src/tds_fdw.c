@@ -108,6 +108,8 @@ static char* last_error_message = NULL;
 bool tds_remote_proc_query_timed_out = false;
 
 static char *tds_err_msg(int severity, int dberr, int oserr, char *dberrstr, char *oserrstr);
+static int tds_dblib_err_handler(DBPROCESS *dbproc, int severity, int dberr,
+					 int oserr, char *dberrstr, char *oserrstr);
 
 /* signal handling */
 static volatile bool interrupt_flag = false;

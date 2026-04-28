@@ -29,7 +29,6 @@ struct TdsLsConnCacheEntry
 	TdsLsConnDropReason drop_reason;
 	uint32		server_hashvalue;
 	uint32		mapping_hashvalue;
-	bool		is_sql_server;
 	bool		sqlserver_ansi_mode;
 	TdsDblibErrHandler runtime_err_handler;
 };
@@ -187,7 +186,6 @@ tdsLinkedServerConnectionDisconnectEntry(TdsLsConnCacheEntry *entry)
 	entry->state = TDS_LS_CONN_DISCONNECTED;
 	entry->drop_reason = TDS_LS_CONN_DROP_NONE;
 	entry->runtime_err_handler = NULL;
-	entry->is_sql_server = false;
 	entry->sqlserver_ansi_mode = false;
 }
 
@@ -266,7 +264,6 @@ tdsLinkedServerConnectionCheckout(Oid serverid,
 		entry->drop_reason = TDS_LS_CONN_DROP_NONE;
 		entry->server_hashvalue = 0;
 		entry->mapping_hashvalue = 0;
-		entry->is_sql_server = false;
 		entry->sqlserver_ansi_mode = false;
 		entry->runtime_err_handler = NULL;
 	}
@@ -291,7 +288,6 @@ tdsLinkedServerConnectionCheckout(Oid serverid,
 		entry->mapping_hashvalue =
 			GetSysCacheHashValue1(USERMAPPINGOID,
 						  ObjectIdGetDatum(mapping->umid));
-		entry->is_sql_server = tdsIsSqlServer(entry->dbproc);
 		entry->sqlserver_ansi_mode = option_set.sqlserver_ansi_mode;
 		entry->runtime_err_handler = runtime_err_handler;
 		entry->state = TDS_LS_CONN_READY;
@@ -356,9 +352,6 @@ fail:
 static bool
 tdsLinkedServerConnectionResetSession(TdsLsConnCacheEntry *entry)
 {
-	if (!entry->is_sql_server)
-		return false;
-
 	if (!tdsExecCleanupSql(entry, TDS_LS_RESET_SQLSERVER_SESSION))
 		return false;
 
